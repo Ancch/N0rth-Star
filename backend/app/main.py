@@ -1,64 +1,114 @@
 # backend/app/main.py
 from __future__ import annotations
-from backend.app.active_scanner import active_scan_url
-from fastapi import FastAPI, Depends
-from fastapi.responses import StreamingResponse, HTMLResponse
-from sqlmodel import Session, select
+
+import asyncio
+import json
+import os
+import time
 from datetime import datetime, timedelta
-import json, time
 from pathlib import Path
-from backend.app.simulator import generate_attack_logs
-from backend.app.db import init_db, get_session, engine
+
+from fastapi import Depends, FastAPI
+from fastapi.responses import HTMLResponse, StreamingResponse
+from sqlmodel import Session, select
+
 from backend.app.auth import require_api_key
-from backend.app.models import Alert, Post, Asset, ScanFinding, Run
+from backend.app.collector import collect_source, load_sources_yaml, normalize_posts
+from backend.app.db import engine, get_session, init_db
+from backend.app.models import Alert, Asset, Post, Run, ScanFinding
 from backend.app.pipeline_store import upsert_post_and_alert
-from backend.app.collector import load_sources_yaml, collect_source, normalize_posts
-from backend.app.scanner import passive_scan_url
 from backend.app.reporter import build_report_context
-from backend.app.scraper import scrape_url
+from backend.app.scanner import passive_scan_url
+from backend.app.scraper import scrape_url  # returns ScrapeResult
 from jinja2 import Template
 
 app = FastAPI(title="North Star API", version="1.0")
 
+
+# -----------------------------
+# Config toggles (safe defaults)
+# -----------------------------
+AUTO_COLLECT = os.getenv("NORTHSTAR_AUTO_COLLECT", "1") == "1"
+AUTO_SCAN = os.getenv("NORTHSTAR_AUTO_SCAN", "1") == "1"
+AUTO_RETRAIN = os.getenv("NORTHSTAR_AUTO_RETRAIN", "0") == "1"  # default OFF
+COLLECT_INTERVAL_SECONDS = int(os.getenv("NORTHSTAR_COLLECT_INTERVAL", "60"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("NORTHSTAR_SCAN_INTERVAL", "120"))
+RETRAIN_INTERVAL_SECONDS = int(os.getenv("NORTHSTAR_RETRAIN_INTERVAL", "1800"))  # 30 min
+
+
+# -----------------------------
+# Startup
+# -----------------------------
+@app.on_event("startup")
+async def startup():
+    init_db()
+
+    # Background loops (automation)
+    if AUTO_COLLECT:
+        asyncio.create_task(auto_collector_loop())
+    if AUTO_SCAN:
+        asyncio.create_task(auto_scan_loop())
+    if AUTO_RETRAIN:
+        asyncio.create_task(auto_retrain_loop())
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "auto": {"collect": AUTO_COLLECT, "scan": AUTO_SCAN, "retrain": AUTO_RETRAIN}}
+
+
+# -----------------------------
+# Live dashboard (HTML)
+# -----------------------------
 @app.get("/live")
 def live():
     html = Path("backend/app/templates/live.html").read_text(encoding="utf-8")
     return HTMLResponse(html)
 
-@app.on_event("startup")
-def startup():
-    init_db()
-
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
 
 # -----------------------------
-# DEMO JSON FEED
+# DEMO JSON FEED (for local demo_forum scraping)
 # -----------------------------
 @app.get("/demo/feed.json")
 def demo_feed():
     now = datetime.utcnow().isoformat() + "Z"
     return {
         "items": [
-            {"title": "telecom creds for sale", "author": "x", "created_at": now, "url": "local://2",
-             "text": "selling telecom db creds. password=hunter2"},
-            {"title": "upi attack planning", "author": "y", "created_at": now, "url": "local://3",
-             "text": "planning ddos on upi gateway tonight"},
-            {"title": "private key leak", "author": "z", "created_at": now, "url": "local://4",
-             "text": "-----BEGIN PRIVATE KEY-----\nMIIE...FAKE\n-----END PRIVATE KEY-----"},
-            {"title": "vulnerability report", "author": "secops", "created_at": now, "url": "local://5",
-             "text": "CVE discussion on exposed service"},
-            {"title": "noise", "author": "n", "created_at": now, "url": "local://6",
-             "text": "football match tonight was great"},
+            {
+                "title": "telecom creds for sale",
+                "author": "x",
+                "created_at": now,
+                "url": "local://2",
+                "text": "selling telecom db creds. password=hunter2",
+            },
+            {
+                "title": "upi attack planning",
+                "author": "y",
+                "created_at": now,
+                "url": "local://3",
+                "text": "planning ddos on upi gateway tonight",
+            },
+            {
+                "title": "private key leak",
+                "author": "z",
+                "created_at": now,
+                "url": "local://4",
+                "text": "-----BEGIN PRIVATE KEY-----\nMIIE...FAKE\n-----END PRIVATE KEY-----",
+            },
+            {
+                "title": "vulnerability report",
+                "author": "secops",
+                "created_at": now,
+                "url": "local://5",
+                "text": "CVE discussion on exposed service",
+            },
+            {"title": "noise", "author": "n", "created_at": now, "url": "local://6", "text": "football match tonight was great"},
         ]
     }
 
 
 # -----------------------------
-# URL scrape -> store post/alert
+# URL -> scrape -> ML -> store -> return
 # -----------------------------
 @app.post("/scan/url")
 def scan_url(payload: dict, ok=Depends(require_api_key), session: Session = Depends(get_session)):
@@ -68,6 +118,7 @@ def scan_url(payload: dict, ok=Depends(require_api_key), session: Session = Depe
 
     res = scrape_url(url)
 
+    # If fetch fails: do NOT poison ML with error strings
     if not res.ok:
         alert = {
             "category": "fetch_failed",
@@ -83,6 +134,7 @@ def scan_url(payload: dict, ok=Depends(require_api_key), session: Session = Depe
         }
         return {"ok": False, "url": url, "fetch": {"error": res.error, "used_insecure_ssl": res.used_insecure_ssl}, "alert": alert}
 
+    # Store so it appears in /alerts + SSE
     post_id, alert_id = upsert_post_and_alert(
         session,
         source="url_scan",
@@ -91,7 +143,7 @@ def scan_url(payload: dict, ok=Depends(require_api_key), session: Session = Depe
         author=None,
         created_at=None,
         text=res.text,
-        vuln_features=None
+        vuln_features=None,
     )
 
     return {
@@ -99,70 +151,9 @@ def scan_url(payload: dict, ok=Depends(require_api_key), session: Session = Depe
         "url": url,
         "fetch": {"status_code": res.status_code, "used_insecure_ssl": res.used_insecure_ssl, "note": res.error},
         "post_id": post_id,
-        "alert_id": alert_id
+        "alert_id": alert_id,
     }
 
-@app.post("/scan/active")
-def scan_active(payload: dict, ok=Depends(require_api_key), session: Session = Depends(get_session)):
-    url = payload.get("url")
-    if not url:
-        return {"ok": False, "error": "Missing url"}
-
-    res = active_scan_url(url)
-
-    # Create a vulnerability alert if notable
-    notable = [f for f in res.findings if f.get("severity", 0) >= 4]
-    vuln_features = None
-    if notable:
-        vuln_features = {
-            "cvss": 7.5,
-            "internet_exposed": True,
-            "asset_criticality": "medium",
-            "patch_age_days": 30,
-            "known_exploit": False,
-            "env": "prod",
-            "auth_required": False,
-            "attack_surface": "web",
-        }
-
-    text = f"Active scan for {url}: findings={len(res.findings)} notes={'; '.join(res.notes)}"
-    for f in res.findings[:12]:
-        text += f"\n- {f['type']}: {f.get('evidence')}"
-
-    post_id, alert_id = upsert_post_and_alert(
-        session,
-        source="active_scan",
-        url=url,
-        title="active scan result",
-        author="scanner",
-        created_at=None,
-        text=text,
-        vuln_features=vuln_features
-    )
-
-    return {"ok": res.ok, "url": url, "status": res.status, "post_id": post_id, "alert_id": alert_id, "findings": res.findings, "notes": res.notes}
-
-@app.post("/simulate/attacks")
-def simulate_attacks(ok=Depends(require_api_key), session: Session = Depends(get_session)):
-    logs = generate_attack_logs(20)
-
-    inserted = 0
-
-    for log in logs:
-        _, alert_id = upsert_post_and_alert(
-            session,
-            source="simulator",
-            url=log["url"],
-            title=log["title"],
-            author=log["author"],
-            created_at=log["created_at"],
-            text=log["text"],
-            vuln_features=None
-        )
-        if alert_id != -1:
-            inserted += 1
-
-    return {"ok": True, "generated": inserted}
 
 # -----------------------------
 # Ingest single post (manual)
@@ -188,57 +179,30 @@ def ingest_demo(payload: dict, ok=Depends(require_api_key), session: Session = D
 
 
 # -----------------------------
-# Sources
+# Sources + Collector (manual trigger)
 # -----------------------------
 @app.get("/sources")
 def list_sources(ok=Depends(require_api_key)):
     return {"sources": load_sources_yaml()}
 
 
-# -----------------------------
-# Collector (FAST MODE)
-# -----------------------------
 @app.post("/collect/run")
-def collect_run(
-    max_seconds: int = 20,
-    ok=Depends(require_api_key),
-    session: Session = Depends(get_session)
-):
-    """
-    Fast collector:
-    - Stops after max_seconds total.
-    - Skips any source that errors/times out.
-    - Returns partial results quickly (demo-safe).
-    """
-    started = time.time()
-
+def collect_run(ok=Depends(require_api_key), session: Session = Depends(get_session)):
     run = Run(kind="collect", started_at=datetime.utcnow(), stats_json={})
-    session.add(run); session.commit(); session.refresh(run)
+    session.add(run)
+    session.commit()
+    session.refresh(run)
 
     inserted_posts = 0
     created_alerts = 0
     errors = []
-    sources_ok = 0
-    sources_skipped = 0
 
     for cfg in load_sources_yaml():
         if not cfg.get("enabled", True):
-            sources_skipped += 1
             continue
-
-        # Global deadline: avoid hanging the endpoint
-        if time.time() - started > max_seconds:
-            errors.append({"source": "collector", "error": f"Stopped early: max_seconds={max_seconds} hit"})
-            break
-
-        name = cfg.get("name")
-
         try:
             posts = collect_source(cfg)
             normalized = normalize_posts(posts)
-
-            sources_ok += 1
-
             for p in normalized:
                 _post_id, alert_id = upsert_post_and_alert(
                     session,
@@ -248,32 +212,24 @@ def collect_run(
                     author=p["author"],
                     created_at=p["created_at"],
                     text=p["text"],
-                    vuln_features=cfg.get("vuln_features")
+                    vuln_features=cfg.get("vuln_features"),
                 )
-                # upsert returns -1 when deduped
                 if alert_id != -1:
                     inserted_posts += 1
                     created_alerts += 1
-
         except Exception as e:
-            errors.append({"source": name, "error": str(e)})
+            errors.append({"source": cfg.get("name"), "error": str(e)})
 
     run.ended_at = datetime.utcnow()
-    run.stats_json = {
-        "inserted_posts": inserted_posts,
-        "created_alerts": created_alerts,
-        "errors": errors,
-        "max_seconds": max_seconds,
-        "sources_ok": sources_ok,
-        "sources_skipped": sources_skipped
-    }
-    session.add(run); session.commit()
+    run.stats_json = {"inserted_posts": inserted_posts, "created_alerts": created_alerts, "errors": errors}
+    session.add(run)
+    session.commit()
 
-    return {"ok": True, "inserted_posts": inserted_posts, "created_alerts": created_alerts, "errors": errors, "max_seconds": max_seconds}
+    return {"ok": True, "inserted_posts": inserted_posts, "created_alerts": created_alerts, "errors": errors}
 
 
 # -----------------------------
-# Alerts APIs
+# Alerts API
 # -----------------------------
 @app.get("/alerts")
 def list_alerts(min_score: float = 0.0, session: Session = Depends(get_session)):
@@ -282,24 +238,28 @@ def list_alerts(min_score: float = 0.0, session: Session = Depends(get_session))
     out = []
     for a in alerts:
         p = session.get(Post, a.post_id) if a.post_id else None
-        out.append({
-            "id": a.id,
-            "score": a.score,
-            "sector": a.sector,
-            "category": a.category,
-            "intent": a.intent,
-            "intent_confidence": a.intent_confidence,
-            "status": a.status,
-            "created_at": a.created_at.isoformat(timespec="seconds"),
-            "post": {
-                "id": p.id if p else None,
-                "source": p.source if p else None,
-                "url": p.url if p else None,
-                "title": p.title if p else None,
-            } if p else None,
-            "asset_id": a.asset_id,
-            "vuln_risk": {"score": a.vuln_risk_score, "method": a.vuln_risk_method} if a.vuln_risk_score is not None else None
-        })
+        out.append(
+            {
+                "id": a.id,
+                "score": a.score,
+                "sector": a.sector,
+                "category": a.category,
+                "intent": a.intent,
+                "intent_confidence": a.intent_confidence,
+                "status": a.status,
+                "created_at": a.created_at.isoformat(timespec="seconds"),
+                "post": {
+                    "id": p.id if p else None,
+                    "source": p.source if p else None,
+                    "url": p.url if p else None,
+                    "title": p.title if p else None,
+                }
+                if p
+                else None,
+                "asset_id": a.asset_id,
+                "vuln_risk": {"score": a.vuln_risk_score, "method": a.vuln_risk_method} if a.vuln_risk_score is not None else None,
+            }
+        )
     return {"alerts": out}
 
 
@@ -309,18 +269,20 @@ def top_threats(limit: int = 5, session: Session = Depends(get_session)):
     out = []
     for a in alerts:
         p = session.get(Post, a.post_id) if a.post_id else None
-        out.append({
-            "id": a.id,
-            "score": a.score,
-            "sector": a.sector,
-            "category": a.category,
-            "intent": a.intent,
-            "created_at": a.created_at.isoformat(timespec="seconds"),
-            "title": (p.title if p else None),
-            "url": (p.url if p else None),
-            "source": (p.source if p else None),
-            "asset_id": a.asset_id,
-        })
+        out.append(
+            {
+                "id": a.id,
+                "score": a.score,
+                "sector": a.sector,
+                "category": a.category,
+                "intent": a.intent,
+                "created_at": a.created_at.isoformat(timespec="seconds"),
+                "title": (p.title if p else None),
+                "url": (p.url if p else None),
+                "source": (p.source if p else None),
+                "asset_id": a.asset_id,
+            }
+        )
     return {"top": out}
 
 
@@ -338,7 +300,7 @@ def trends(days: int = 7, session: Session = Depends(get_session)):
 
 
 # -----------------------------
-# Assets + Scan (unchanged)
+# Assets + Passive scan run (manual)
 # -----------------------------
 @app.post("/assets/add")
 def add_asset(payload: dict, ok=Depends(require_api_key), session: Session = Depends(get_session)):
@@ -348,7 +310,9 @@ def add_asset(payload: dict, ok=Depends(require_api_key), session: Session = Dep
         return {"ok": True, "asset_id": existing.id}
 
     a = Asset(kind=payload.get("kind", "url"), value=value, owner=payload.get("owner"), tags=payload.get("tags", {}))
-    session.add(a); session.commit(); session.refresh(a)
+    session.add(a)
+    session.commit()
+    session.refresh(a)
     return {"ok": True, "asset_id": a.id}
 
 
@@ -361,7 +325,9 @@ def list_assets(ok=Depends(require_api_key), session: Session = Depends(get_sess
 @app.post("/scan/run")
 def scan_run(ok=Depends(require_api_key), session: Session = Depends(get_session)):
     run = Run(kind="scan", started_at=datetime.utcnow(), stats_json={})
-    session.add(run); session.commit(); session.refresh(run)
+    session.add(run)
+    session.commit()
+    session.refresh(run)
 
     assets = session.exec(select(Asset).where(Asset.active == True)).all()
     created_alerts = 0
@@ -374,26 +340,64 @@ def scan_run(ok=Depends(require_api_key), session: Session = Depends(get_session
         res = passive_scan_url(a.value)
 
         if res.missing_headers:
-            sf = ScanFinding(asset_id=a.id, type="missing_security_headers",
-                             severity=min(10, 3 + len(res.missing_headers)),
-                             evidence_json={"missing": res.missing_headers, "status": res.http_status, "url": res.url})
-            session.add(sf); findings_written += 1
+            sf = ScanFinding(
+                asset_id=a.id,
+                type="missing_security_headers",
+                severity=min(10, 3 + len(res.missing_headers)),
+                evidence_json={"missing": res.missing_headers, "status": res.http_status, "url": res.url},
+            )
+            session.add(sf)
+            findings_written += 1
 
         if res.tls_days_left is not None and res.tls_days_left <= 14:
-            sf = ScanFinding(asset_id=a.id, type="tls_expiring_soon", severity=8,
-                             evidence_json={"tls_days_left": res.tls_days_left, "url": res.url})
-            session.add(sf); findings_written += 1
+            sf = ScanFinding(asset_id=a.id, type="tls_expiring_soon", severity=8, evidence_json={"tls_days_left": res.tls_days_left, "url": res.url})
+            session.add(sf)
+            findings_written += 1
 
         if res.server_header:
-            sf = ScanFinding(asset_id=a.id, type="server_disclosure", severity=4,
-                             evidence_json={"server": res.server_header, "url": res.url})
-            session.add(sf); findings_written += 1
+            sf = ScanFinding(asset_id=a.id, type="server_disclosure", severity=4, evidence_json={"server": res.server_header, "url": res.url})
+            session.add(sf)
+            findings_written += 1
 
         session.commit()
 
+        if res.missing_headers or (res.tls_days_left is not None and res.tls_days_left <= 14):
+            vuln_features = {
+                "cvss": 6.8 if res.missing_headers else 7.5,
+                "internet_exposed": True,
+                "asset_criticality": (a.tags.get("criticality") if isinstance(a.tags, dict) else "medium") or "medium",
+                "patch_age_days": 30,
+                "known_exploit": False,
+                "env": (a.tags.get("env") if isinstance(a.tags, dict) else "prod") or "prod",
+                "auth_required": False,
+                "attack_surface": "web",
+            }
+
+            text = f"Passive scan findings for {a.value}: missing_headers={len(res.missing_headers)}, tls_days_left={res.tls_days_left}, server={res.server_header}"
+            alert_obj = __import__("ml.pipeline", fromlist=["build_alert"]).build_alert(text, vuln_features=vuln_features)
+
+            al = Alert(
+                asset_id=a.id,
+                post_id=None,
+                category="vulnerability",
+                sector="other",
+                intent="discussion",
+                intent_confidence=0.6,
+                score=float(alert_obj["score"]),
+                score_reasons={"reasons": alert_obj.get("score_reasons", []) + [f"Scan url: {a.value}"]},
+                status="open",
+                created_at=datetime.utcnow(),
+                vuln_risk_score=float(alert_obj["vuln_risk"]["score"]) if alert_obj.get("vuln_risk") else None,
+                vuln_risk_method=alert_obj.get("vuln_risk", {}).get("method") if alert_obj.get("vuln_risk") else None,
+            )
+            session.add(al)
+            session.commit()
+            created_alerts += 1
+
     run.ended_at = datetime.utcnow()
     run.stats_json = {"assets": len(assets), "created_alerts": created_alerts, "findings_written": findings_written}
-    session.add(run); session.commit()
+    session.add(run)
+    session.commit()
 
     return {"ok": True, "assets": len(assets), "created_alerts": created_alerts, "findings_written": findings_written}
 
@@ -409,7 +413,7 @@ def report_html(days: int = 7, ok=Depends(require_api_key), session: Session = D
 
 
 # -----------------------------
-# SSE stream
+# SSE stream (live dashboard)
 # -----------------------------
 @app.get("/alerts/stream")
 def alerts_stream():
@@ -445,5 +449,138 @@ def alerts_stream():
 
             time.sleep(1)
 
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
+# =============================
+# AUTOMATION LOOPS (Background)
+# =============================
+async def auto_collector_loop():
+    # Wait for app boot
+    await asyncio.sleep(3)
+    while True:
+        try:
+            with Session(engine) as session:
+                inserted = 0
+                created = 0
+                errors = []
+
+                for cfg in load_sources_yaml():
+                    if not cfg.get("enabled", True):
+                        continue
+                    try:
+                        posts = collect_source(cfg)
+                        normalized = normalize_posts(posts)
+                        for p in normalized:
+                            _post_id, alert_id = upsert_post_and_alert(
+                                session,
+                                source=p["source"],
+                                url=p["url"],
+                                title=p["title"],
+                                author=p["author"],
+                                created_at=p["created_at"],
+                                text=p["text"],
+                                vuln_features=cfg.get("vuln_features"),
+                            )
+                            if alert_id != -1:
+                                inserted += 1
+                                created += 1
+                    except Exception as e:
+                        errors.append({"source": cfg.get("name"), "error": str(e)})
+
+                # log a Run row so you can show “continuous monitoring”
+                run = Run(kind="auto_collect", started_at=datetime.utcnow(), ended_at=datetime.utcnow(), stats_json={"inserted_posts": inserted, "created_alerts": created, "errors": errors})
+                session.add(run)
+                session.commit()
+
+                if inserted or created:
+                    print(f"🚀 [AUTO_COLLECT] inserted={inserted} alerts={created}")
+                if errors:
+                    print(f"⚠️ [AUTO_COLLECT] errors={len(errors)}")
+
+        except Exception as e:
+            print("❌ [AUTO_COLLECT] fatal:", e)
+
+        await asyncio.sleep(COLLECT_INTERVAL_SECONDS)
+
+
+async def auto_scan_loop():
+    await asyncio.sleep(5)
+    while True:
+        try:
+            with Session(engine) as session:
+                assets = session.exec(select(Asset).where(Asset.active == True)).all()
+                created_alerts = 0
+
+                for a in assets:
+                    if a.kind != "url":
+                        continue
+
+                    res = passive_scan_url(a.value)
+
+                    notable = bool(res.missing_headers) or (res.tls_days_left is not None and res.tls_days_left <= 14)
+                    if not notable:
+                        continue
+
+                    vuln_features = {
+                        "cvss": 6.8 if res.missing_headers else 7.5,
+                        "internet_exposed": True,
+                        "asset_criticality": (a.tags.get("criticality") if isinstance(a.tags, dict) else "medium") or "medium",
+                        "patch_age_days": 30,
+                        "known_exploit": False,
+                        "env": (a.tags.get("env") if isinstance(a.tags, dict) else "prod") or "prod",
+                        "auth_required": False,
+                        "attack_surface": "web",
+                    }
+
+                    text = f"Auto passive scan findings for {a.value}: missing_headers={len(res.missing_headers)}, tls_days_left={res.tls_days_left}, server={res.server_header}"
+                    alert_obj = __import__("ml.pipeline", fromlist=["build_alert"]).build_alert(text, vuln_features=vuln_features)
+
+                    al = Alert(
+                        asset_id=a.id,
+                        post_id=None,
+                        category="vulnerability",
+                        sector="other",
+                        intent="discussion",
+                        intent_confidence=0.6,
+                        score=float(alert_obj["score"]),
+                        status="open",
+                        created_at=datetime.utcnow(),
+                        vuln_risk_score=float(alert_obj["vuln_risk"]["score"]) if alert_obj.get("vuln_risk") else None,
+                        vuln_risk_method=alert_obj.get("vuln_risk", {}).get("method") if alert_obj.get("vuln_risk") else None,
+                    )
+                    session.add(al)
+                    created_alerts += 1
+
+                if created_alerts:
+                    session.commit()
+                    print(f"🛰️ [AUTO_SCAN] created_alerts={created_alerts}")
+
+                run = Run(kind="auto_scan", started_at=datetime.utcnow(), ended_at=datetime.utcnow(), stats_json={"assets": len(assets), "created_alerts": created_alerts})
+                session.add(run)
+                session.commit()
+
+        except Exception as e:
+            print("❌ [AUTO_SCAN] fatal:", e)
+
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+
+async def auto_retrain_loop():
+    """
+    Optional. Default OFF (NORTHSTAR_AUTO_RETRAIN=0).
+    If you enable it, it retrains your small TF-IDF models periodically.
+    """
+    await asyncio.sleep(10)
+    while True:
+        try:
+            print("🧠 [AUTO_RETRAIN] running...")
+            import subprocess
+
+            subprocess.run(["python", "ml/train_intent.py"], check=False)
+            subprocess.run(["python", "ml/train_sector.py"], check=False)
+            print("🧠 [AUTO_RETRAIN] done")
+        except Exception as e:
+            print("❌ [AUTO_RETRAIN] fatal:", e)
+
+        await asyncio.sleep(RETRAIN_INTERVAL_SECONDS)
