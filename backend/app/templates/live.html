@@ -2,76 +2,162 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>North Star Live</title>
   <style>
-    body { font-family: system-ui; margin: 20px; }
-    .row { display:flex; gap:12px; flex-wrap:wrap; }
-    .card { border:1px solid #ddd; border-radius:12px; padding:12px; width:340px; }
-    .score { font-size:26px; font-weight:700; }
-    .pill { display:inline-block; padding:3px 8px; border-radius:999px; background:#f2f2f2; margin-right:6px; font-size:12px; }
-    .muted { color:#666; font-size:12px; }
-    button { padding:8px 10px; border-radius:10px; border:1px solid #ccc; background:white; cursor:pointer; }
-    input { padding:8px; border-radius:10px; border:1px solid #ccc; width:420px; }
+    body { font-family: ui-sans-serif, system-ui; background:#0b0f14; color:#e6edf3; margin:0; }
+    header { padding:16px 20px; border-bottom:1px solid #1f2a37; display:flex; gap:12px; align-items:center; }
+    .pill { font-size:12px; padding:4px 10px; border:1px solid #2a3a4d; border-radius:999px; color:#9fb4c9; }
+    .wrap { padding:18px 20px; display:grid; grid-template-columns: 360px 1fr; gap:16px; }
+    .panel { border:1px solid #1f2a37; border-radius:14px; background:#0f1620; padding:14px; }
+    .cards { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap:12px; }
+    .card { border:1px solid #233043; border-radius:14px; background:#0c121b; padding:12px; }
+    .title { font-weight:700; margin:0 0 6px 0; font-size:14px; }
+    .meta { display:flex; gap:8px; flex-wrap:wrap; font-size:12px; color:#9fb4c9; }
+    .tag { padding:2px 8px; border-radius:999px; border:1px solid #2a3a4d; }
+    .score { font-weight:800; font-size:18px; }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .btn { cursor:pointer; background:#152234; border:1px solid #2a3a4d; color:#e6edf3; padding:8px 10px; border-radius:10px; }
+    input { width:100%; box-sizing:border-box; padding:10px; border-radius:10px; border:1px solid #2a3a4d; background:#0b0f14; color:#e6edf3; }
+    a { color:#7cc4ff; text-decoration:none; }
+    small { color:#9fb4c9; }
   </style>
 </head>
 <body>
-  <h2>🛰️ North Star Live Threat Feed</h2>
+  <header>
+    <div style="font-weight:800">🧠 North Star Live</div>
+    <div class="pill" id="status">connecting…</div>
+    <div class="pill">SSE: /alerts/stream</div>
+  </header>
 
-  <div style="margin: 10px 0 18px 0;">
-    <input id="url" placeholder="https://example.com" />
-    <button onclick="scanUrl()">Scan URL</button>
-    <span class="muted" id="status"></span>
+  <div class="wrap">
+    <div class="panel">
+      <div class="row">
+        <div>
+          <div style="font-weight:800;margin-bottom:4px;">Quick actions</div>
+          <small>Ingest demo + pull OSINT</small>
+        </div>
+      </div>
+      <div style="height:10px"></div>
+
+      <button class="btn" id="btnCollect">Run Collector</button>
+      <div style="height:10px"></div>
+
+      <div style="font-weight:700;margin:10px 0 6px;">Scan URL</div>
+      <input id="scanUrl" placeholder="https://example.com" />
+      <div style="height:8px"></div>
+      <button class="btn" id="btnScan">Scan</button>
+
+      <hr style="border:none;border-top:1px solid #1f2a37;margin:14px 0;">
+
+      <div style="font-weight:700;margin-bottom:6px;">Filter</div>
+      <input id="q" placeholder="type to filter cards (sector/category/source/title)" />
+      <div style="height:10px"></div>
+      <small id="counts">0 alerts</small>
+    </div>
+
+    <div class="panel">
+      <div class="row">
+        <div style="font-weight:800">Alert Cards</div>
+        <div class="pill" id="hb">heartbeat: -</div>
+      </div>
+      <div style="height:12px"></div>
+      <div class="cards" id="cards"></div>
+    </div>
   </div>
 
-  <div class="row" id="cards"></div>
-
 <script>
-const cards = document.getElementById("cards");
+const API_KEY = "dev"; // matches your backend/app/auth.py
+const cardsEl = document.getElementById("cards");
 const statusEl = document.getElementById("status");
+const hbEl = document.getElementById("hb");
+const qEl = document.getElementById("q");
+const countsEl = document.getElementById("counts");
 
-function cardHTML(a) {
-  return `
-  <div class="card">
-    <div class="score">${Number(a.score).toFixed(1)}</div>
-    <div style="margin:6px 0;">
-      <span class="pill">${a.category}</span>
-      <span class="pill">${a.sector}</span>
-      <span class="pill">${a.intent}</span>
-    </div>
-    <div><b>${a.title || "(no title)"}</b></div>
-    <div class="muted">${a.source || ""} ${a.url || ""}</div>
-    <div class="muted">#${a.id} • ${a.created_at}</div>
-  </div>`;
-}
+let all = [];
 
-function pushCard(a) {
-  const div = document.createElement("div");
-  div.innerHTML = cardHTML(a);
-  cards.prepend(div.firstElementChild);
-}
-
-async function scanUrl() {
-  const u = document.getElementById("url").value.trim();
-  if (!u) return;
-  statusEl.textContent = "scanning…";
-  const r = await fetch("/scan/url", {
-    method: "POST",
-    headers: {"Content-Type":"application/json", "x-api-key":"dev"},
-    body: JSON.stringify({url: u})
+function render(){
+  const q = (qEl.value || "").toLowerCase();
+  const filtered = all.filter(a => {
+    const hay = [
+      a.title, a.sector, a.category, a.intent, a.source, a.url
+    ].join(" ").toLowerCase();
+    return hay.includes(q);
   });
-  const j = await r.json();
-  statusEl.textContent = j.ok
-    ? `stored post_id=${j.post_id} alert_id=${j.alert_id}`
-    : `failed: ${(j.fetch && j.fetch.error) ? j.fetch.error : (j.error || "unknown")}`;
+
+  countsEl.textContent = `${filtered.length} alerts`;
+
+  cardsEl.innerHTML = filtered.map(a => `
+    <div class="card">
+      <div class="row">
+        <div class="score">${Math.round(a.score)}</div>
+        <div class="meta">
+          <span class="tag">${a.category}</span>
+          <span class="tag">${a.sector}</span>
+          <span class="tag">${a.intent}</span>
+        </div>
+      </div>
+      <div style="height:8px"></div>
+      <div class="title">${a.title || "(no title)"}</div>
+      <div class="meta">
+        <span>${a.created_at}</span>
+        <span>•</span>
+        <span>${a.source || "-"}</span>
+      </div>
+      <div style="height:6px"></div>
+      <div class="meta">
+        ${a.url ? `<a href="${a.url}" target="_blank" rel="noreferrer">${a.url}</a>` : "<span>-</span>"}
+      </div>
+    </div>
+  `).join("");
 }
 
-// SSE
+qEl.addEventListener("input", render);
+
+async function postJSON(url, body){
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
+    body: JSON.stringify(body || {})
+  });
+  return r.json();
+}
+
+document.getElementById("btnCollect").onclick = async () => {
+  statusEl.textContent = "collecting…";
+  const data = await fetch("/collect/run?max_seconds=15", { method:"POST", headers: {"x-api-key": API_KEY} }).then(r => r.json());
+  statusEl.textContent = `collector: +${data.created_alerts}`;
+};
+
+document.getElementById("btnScan").onclick = async () => {
+  const url = document.getElementById("scanUrl").value.trim();
+  if(!url) return;
+  statusEl.textContent = "scanning…";
+  const data = await postJSON("/scan/url", { url });
+  statusEl.textContent = data.ok ? "scan ok" : "scan failed";
+};
+
 const es = new EventSource("/alerts/stream");
-es.addEventListener("hello", () => console.log("connected"));
+
+es.addEventListener("open", () => {
+  statusEl.textContent = "connected ✅";
+});
+
+es.addEventListener("error", () => {
+  statusEl.textContent = "SSE error ❌";
+});
+
 es.addEventListener("alert", (ev) => {
   const a = JSON.parse(ev.data);
-  pushCard(a);
+  all.unshift(a);
+  if(all.length > 200) all.pop();
+  render();
 });
+
+setInterval(() => {
+  hbEl.textContent = "heartbeat: " + new Date().toLocaleTimeString();
+}, 5000);
 </script>
 </body>
 </html>
+

@@ -1,28 +1,50 @@
 # backend/app/sources.yaml
+sources:
+  - name: demo_forum
+    enabled: true
+    url: "http://localhost:8000/demo/feed.json"
+    method: "json"
+    interval_seconds: 60
+    timeout_seconds: 10
+    retries: 1
+    backoff_base: 0.5
+    max_items: 50
+    json_items_path: "items"
+    json_title_key: "title"
+    json_url_key: "url"
+    json_author_key: "author"
+    json_time_key: "created_at"
+    json_text_key: "text"
 
-- name: demo_forum
-  url: http://localhost:8000/demo/feed.json
-  method: json
-  interval_seconds: 60
-  timeout_seconds: 15
-  json_items_path: items
-  json_title_key: title
-  json_url_key: url
-  json_author_key: author
-  json_time_key: created_at
-  json_text_key: text
-  enabled: true
+  - name: full_disclosure
+    enabled: true
+    url: "https://seclists.org/rss/fulldisclosure.rss"
+    method: "rss"
+    interval_seconds: 3600
+    timeout_seconds: 20
+    retries: 2
+    backoff_base: 0.8
+    max_items: 50
 
-- name: exploitdb
-  url: https://www.exploit-db.com/rss.xml
-  method: rss
-  interval_seconds: 1800
-  timeout_seconds: 45
-  enabled: true
+  # ExploitDB ingestion via git mirror CSV (convert rows -> post-like items)
+  # NOTE: this is NOT scraping random HTML, it's pulling structured data.
+  - name: exploitdb
+    enabled: true
+    url: "https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv"
+    method: "exploitdb_csv"
+    interval_seconds: 7200
+    timeout_seconds: 30
+    retries: 2
+    backoff_base: 0.8
+    max_items: 40
 
-- name: cisa_kev
-  url: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.xml
-  method: rss
-  interval_seconds: 3600
-  timeout_seconds: 60
-  enabled: true
+  # CISA KEV - disabled because your network timed out repeatedly
+  - name: cisa_kev
+    enabled: false
+    url: "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.xml"
+    method: "rss"
+    interval_seconds: 3600
+    timeout_seconds: 30
+    retries: 1
+    backoff_base: 1.2
+    max_items: 40

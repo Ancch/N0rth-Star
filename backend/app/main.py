@@ -1,13 +1,13 @@
 # backend/app/main.py
 from __future__ import annotations
-
+from backend.app.active_scanner import active_scan_url
 from fastapi import FastAPI, Depends
 from fastapi.responses import StreamingResponse, HTMLResponse
 from sqlmodel import Session, select
 from datetime import datetime, timedelta
 import json, time
 from pathlib import Path
-
+from backend.app.simulator import generate_attack_logs
 from backend.app.db import init_db, get_session, engine
 from backend.app.auth import require_api_key
 from backend.app.models import Alert, Post, Asset, ScanFinding, Run
@@ -20,6 +20,10 @@ from jinja2 import Template
 
 app = FastAPI(title="North Star API", version="1.0")
 
+@app.get("/live")
+def live():
+    html = Path("backend/app/templates/live.html").read_text(encoding="utf-8")
+    return HTMLResponse(html)
 
 @app.on_event("startup")
 def startup():
@@ -98,6 +102,67 @@ def scan_url(payload: dict, ok=Depends(require_api_key), session: Session = Depe
         "alert_id": alert_id
     }
 
+@app.post("/scan/active")
+def scan_active(payload: dict, ok=Depends(require_api_key), session: Session = Depends(get_session)):
+    url = payload.get("url")
+    if not url:
+        return {"ok": False, "error": "Missing url"}
+
+    res = active_scan_url(url)
+
+    # Create a vulnerability alert if notable
+    notable = [f for f in res.findings if f.get("severity", 0) >= 4]
+    vuln_features = None
+    if notable:
+        vuln_features = {
+            "cvss": 7.5,
+            "internet_exposed": True,
+            "asset_criticality": "medium",
+            "patch_age_days": 30,
+            "known_exploit": False,
+            "env": "prod",
+            "auth_required": False,
+            "attack_surface": "web",
+        }
+
+    text = f"Active scan for {url}: findings={len(res.findings)} notes={'; '.join(res.notes)}"
+    for f in res.findings[:12]:
+        text += f"\n- {f['type']}: {f.get('evidence')}"
+
+    post_id, alert_id = upsert_post_and_alert(
+        session,
+        source="active_scan",
+        url=url,
+        title="active scan result",
+        author="scanner",
+        created_at=None,
+        text=text,
+        vuln_features=vuln_features
+    )
+
+    return {"ok": res.ok, "url": url, "status": res.status, "post_id": post_id, "alert_id": alert_id, "findings": res.findings, "notes": res.notes}
+
+@app.post("/simulate/attacks")
+def simulate_attacks(ok=Depends(require_api_key), session: Session = Depends(get_session)):
+    logs = generate_attack_logs(20)
+
+    inserted = 0
+
+    for log in logs:
+        _, alert_id = upsert_post_and_alert(
+            session,
+            source="simulator",
+            url=log["url"],
+            title=log["title"],
+            author=log["author"],
+            created_at=log["created_at"],
+            text=log["text"],
+            vuln_features=None
+        )
+        if alert_id != -1:
+            inserted += 1
+
+    return {"ok": True, "generated": inserted}
 
 # -----------------------------
 # Ingest single post (manual)
